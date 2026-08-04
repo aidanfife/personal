@@ -41,6 +41,9 @@ if (length(missing_packages) > 0) {
   )
 }
 
+library(coda)
+library(mitml)
+
 suppressPackageStartupMessages({
   library(jomo)
   library(lme4)
