@@ -60,7 +60,7 @@ N_BETWEEN <- 1000L
 
 # Set to TRUE after the main continuous example works. Section 11 then adds an
 # incomplete binary variable so jomo uses its latent-normal mixed-data model.
-RUN_CATEGORICAL_EXTENSION <- FALSE
+RUN_CATEGORICAL_EXTENSION <- TRUE
 
 
 # =============================================================================
@@ -863,10 +863,35 @@ cat(" * FMI quantifies how much pooled uncertainty is attributable to missingnes
 #
 # This block demonstrates data-type handling only. If smoke were part of the
 # substantive analysis, that analysis would also need to be fitted and pooled.
+#
+# WHAT A SUCCESSFUL DEMONSTRATION SHOULD SHOW:
+#   1. jomo reports that it selected jomo1ranmix.
+#   2. Every deleted smoke value is filled, while observed smoke values remain
+#      unchanged.
+#   3. The completed yes/no proportions are reasonably close to the original
+#      complete-data proportions, including among the rows deliberately hidden.
+#      They should not match exactly because each imputation is a random draw.
+#   4. At least some hidden smoke values vary across imputations. That variation
+#      represents uncertainty; identical completed datasets would be suspicious.
+#   5. The smoke.1 coefficients and covariances printed by jomo are on an
+#      underlying latent-normal scale, not the scale of a logistic regression.
+#      Its level-1 variance is fixed at 1 for identification, which is expected.
+#
+# In a real dataset the hidden truth is unavailable. We would instead compare
+# observed and imputed distributions, inspect relationships with key variables,
+# diagnose the mixed-data MCMC chains, and pool any substantive smoke analysis.
+# Exact recovery of each person's true category is not the goal of multiple
+# imputation; recovery of distributions, relationships, and uncertainty is.
 # =============================================================================
 
 if (RUN_CATEGORICAL_EXTENSION) {
   mixed_data <- dat_mar
+
+  # Save the complete smoking values before hiding any of them. This is possible
+  # only because this is a simulation and gives us a benchmark for recovery.
+  smoke_truth <- mixed_data$smoke
+  smoke_levels <- levels(smoke_truth)
+
   set.seed(1101)
   remove_smoke <- runif(nrow(mixed_data)) < 0.20
   mixed_data$smoke[remove_smoke] <- NA
@@ -891,11 +916,96 @@ if (RUN_CATEGORICAL_EXTENSION) {
     output = 1
   )
 
-  cat("\nSmoke distribution across completed datasets:\n")
-  print(prop.table(table(
-    imp_mixed$smoke[imp_mixed$Imputation > 0],
-    useNA = "ifany"
-  )))
+  completed_mixed <- jomo_completed_list(imp_mixed)
+
+  # Basic integrity checks. Both should be TRUE.
+  all_smoke_filled <- all(vapply(
+    completed_mixed,
+    function(data) !anyNA(data$smoke),
+    logical(1)
+  ))
+
+  observed_smoke_unchanged <- all(vapply(
+    completed_mixed,
+    function(data) identical(
+      as.character(data$smoke[!remove_smoke]),
+      as.character(smoke_truth[!remove_smoke])
+    ),
+    logical(1)
+  ))
+
+  cat("\nSmoke imputation integrity checks:\n")
+  cat(sprintf("All missing smoke values filled: %s\n", all_smoke_filled))
+  cat(sprintf("Originally observed smoke values unchanged: %s\n",
+              observed_smoke_unchanged))
+
+  # Compare the full-sample category distribution with the original truth.
+  # The mean-imputation row should be close to complete_truth. Exact equality is
+  # neither required nor expected.
+  smoke_proportions <- function(values) {
+    proportions <- prop.table(table(factor(values, levels = smoke_levels)))
+    stats::setNames(as.numeric(proportions), smoke_levels)
+  }
+
+  completed_smoke_distributions <- do.call(
+    rbind,
+    lapply(completed_mixed, function(data) smoke_proportions(data$smoke))
+  )
+
+  smoke_distribution_comparison <- rbind(
+    complete_truth = smoke_proportions(smoke_truth),
+    observed_after_deletion = smoke_proportions(mixed_data$smoke),
+    completed_smoke_distributions,
+    mean_imputation = colMeans(completed_smoke_distributions)
+  )
+
+  cat("\nFull-sample smoke distribution comparison:\n")
+  print(round(smoke_distribution_comparison, 3))
+
+  # The full-sample comparison is dominated by values that were never missing.
+  # This second table focuses only on the deliberately hidden rows. Across the
+  # five imputations, imputed_yes should fluctuate around true_yes rather than
+  # reproduce it exactly in every dataset.
+  true_yes_hidden <- mean(smoke_truth[remove_smoke] == "yes")
+  imputed_yes_hidden <- vapply(
+    completed_mixed,
+    function(data) mean(data$smoke[remove_smoke] == "yes"),
+    numeric(1)
+  )
+
+  hidden_smoke_recovery <- data.frame(
+    imputation = names(completed_mixed),
+    true_yes = rep(true_yes_hidden, length(completed_mixed)),
+    imputed_yes = imputed_yes_hidden,
+    difference = imputed_yes_hidden - true_yes_hidden,
+    row.names = NULL
+  )
+
+  cat("\nRecovery among the deliberately hidden smoke values:\n")
+  print(transform(
+    hidden_smoke_recovery,
+    true_yes = round(true_yes, 3),
+    imputed_yes = round(imputed_yes, 3),
+    difference = round(difference, 3)
+  ), row.names = FALSE)
+
+  # Multiple imputations should encode uncertainty. This reports the percentage
+  # of hidden people whose imputed category is not identical in all five sets.
+  imputed_smoke_matrix <- vapply(
+    completed_mixed,
+    function(data) as.character(data$smoke[remove_smoke]),
+    character(sum(remove_smoke))
+  )
+  percent_hidden_varying <- 100 * mean(apply(
+    imputed_smoke_matrix,
+    1,
+    function(values) length(unique(values)) > 1
+  ))
+
+  cat(sprintf(
+    "Hidden smoke values varying across imputations: %.1f%%\n",
+    percent_hidden_varying
+  ))
 }
 
 
