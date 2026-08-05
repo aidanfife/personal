@@ -741,14 +741,14 @@ pool_mnar <- pool_x_with_rubin(fits_mnar)
 # The same native jomo output can instead be handed to mitml. This is the
 # package-supported route to use later when you want more general pooled tests:
 #
-# if (requireNamespace("mitml", quietly = TRUE)) {
-#   imp_mar_mitml <- mitml::jomo2mitml.list(imp_mar)
-#   fits_mar_mitml <- with(
-#     imp_mar_mitml,
-#     lme4::lmer(y ~ x + z + (1 | clus), REML = FALSE)
-#   )
-#   print(mitml::testEstimates(fits_mar_mitml))
-# }
+if (requireNamespace("mitml", quietly = TRUE)) {
+  imp_mar_mitml <- mitml::jomo2mitml.list(imp_mar)
+  fits_mar_mitml <- with(
+    imp_mar_mitml,
+    lme4::lmer(y ~ x + z + (1 | clus), REML = FALSE)
+  )
+  print(mitml::testEstimates(fits_mar_mitml))
+}
 
 cat("\n=== Section 9: the five MAR estimates before pooling ===\n")
 print(round(pool_mar$estimates, 4))
