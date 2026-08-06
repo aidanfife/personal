@@ -1,126 +1,100 @@
 # =============================================================================
-# A toy demonstration of JOMO (Joint Modelling Multiple Imputation)
+# JOMO: SIMPLE MULTILEVEL MULTIPLE IMPUTATION EXAMPLE
 # -----------------------------------------------------------------------------
-# Goal: show how multilevel joint-model imputation works, how the native jomo
-#       code is structured, and how it behaves under MCAR / MAR / MNAR.
+# This version is designed to be run line-by-line, like the SMC-FCS example.
+# It uses one MAR scenario and contains no user-written functions.
 #
-# The script is deliberately small and heavily annotated. Read it top to
-# bottom. Each numbered section maps to one idea. Run it with:
+# The purpose is not just to obtain an answer. Each section isolates one stage
+# of the multiple-imputation workflow so a new user can see the distinction
+# between:
+#   1. creating an imputation model,
+#   2. checking the MCMC algorithm,
+#   3. drawing several completed datasets,
+#   4. fitting the substantive analysis model, and
+#   5. pooling the analysis results with Rubin's rules.
 #
-#     Rscript jomo_demo.R
+# Run one numbered section at a time and inspect the objects it creates. The
+# comments explain both what each line does and what a sensible result should
+# look like.
 #
-# or step through it interactively in RStudio.
-#
-# Required packages: jomo, lme4
-# Optional packages: coda (Geweke diagnostic), mitml (alternative pooling)
-#
-# Outputs:
-#   jomo_diagnostics_trace_MAR.png
-#   jomo_diagnostics_acf_MAR.png
-#   jomo_imputed_vs_true_MAR.png
-#
-# IMPORTANT SCOPE NOTE:
-# This is a MULTILEVEL teaching example, not yet a complete NHANES survey
-# implementation. The cluster variable is analogous to a PSU, but jomo's
-# `clus` argument does not, by itself, incorporate survey weights or strata.
+# Required packages: jomo, lme4, mitml, coda
 # =============================================================================
 
-required_packages <- c("jomo", "lme4")
-missing_packages <- required_packages[
-  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
-]
+library(jomo)
+library(lme4)
+library(mitml)
+library(coda)
 
-if (length(missing_packages) > 0) {
-  stop(
-    "Install the required package(s) before running this script: ",
-    paste(missing_packages, collapse = ", "),
-    "\nRun: install.packages(c(",
-    paste(sprintf('"%s"', missing_packages), collapse = ", "),
-    "))",
-    call. = FALSE
-  )
+set.seed(42)
+
+# When the script is run with source(), sys.frame(1)$ofile contains the path to
+# jomo_demo.R. This anchors the output folder beside the script rather than in
+# whatever parent folder happens to be the current working directory.
+if (sys.nframe() > 0 && !is.null(sys.frame(1)$ofile)) {
+  project_directory <- dirname(normalizePath(sys.frame(1)$ofile))
+} else {
+  # Fallback when commands are run individually in the console.
+  project_directory <- getwd()
 }
 
-library(coda)
-library(mitml)
+output_directory <- file.path(project_directory, "jomo_example_output")
+dir.create(output_directory, showWarnings = FALSE)
 
-suppressPackageStartupMessages({
-  library(jomo)
-  library(lme4)
-})
-
-set.seed(42)  # same simulated population every time
-
-# Teaching values. These are not recommendations to copy blindly into the
-# final NHANES analysis; Section 6 shows how diagnostics inform the choices.
-N_IMPUTATIONS <- 5L
-DIAGNOSTIC_ITERATIONS <- 5000L
-N_BURN <- 1000L
-N_BETWEEN <- 1000L
-
-# Set to TRUE after the main continuous example works. Section 11 then adds an
-# incomplete binary variable so jomo uses its latent-normal mixed-data model.
-RUN_CATEGORICAL_EXTENSION <- TRUE
+cat("\nJOMO example output folder:\n")
+cat(normalizePath(output_directory), "\n")
 
 
 # =============================================================================
-# 0.  WHY SIMULATE A CLUSTERED DATASET?
+# 1. BUILD A COMPLETE CLUSTERED DATASET
 # -----------------------------------------------------------------------------
-# Simulation gives us two things a real incomplete dataset cannot:
+# There are 40 clusters with 25 people in each cluster, giving 1,000 rows.
+# Think of a cluster as a school, clinic, neighborhood, or survey PSU, and each
+# row as a person within that cluster. The people are the level-1 units and the
+# clusters are the level-2 units.
 #
-#   1. the TRUE values that will later be hidden, and
-#   2. the TRUE coefficient used to generate the outcome.
+# Both x and y contain cluster-specific random effects. Everyone in a cluster
+# shares the same cluster effect, which makes observations within that cluster
+# more alike than observations from different clusters. This is the dependence
+# structure that motivates multilevel rather than single-level imputation.
 #
-# We also create genuine clustering. Individuals within the same cluster share
-# random intercepts, so their values are correlated. This is the key feature
-# that a multilevel imputation model should preserve.
+# The final analysis model is:
 #
-# The round trip is:
-#   complete clustered data -> create missingness -> impute with jomo ->
-#   analyze each completed dataset -> pool -> compare with the known truth.
+#   y ~ x + z + (1 | cluster_id)
+#
+# The data-generating equations are approximately:
+#
+#   x_ij = 0.5*z_ij + cluster effect for x + individual error
+#
+#   y_ij = 2 + 0.8*x_ij + 1.5*z_ij
+#          + cluster effect for y + individual error
+#
+# The subscript i represents a person and j represents a cluster. The true
+# conditional coefficient of x in the y model is 0.8. Because the dataset is a
+# random finite sample, the complete-data fitted estimate will be near 0.8 but
+# will not normally equal it exactly.
 # =============================================================================
 
-
-# =============================================================================
-# 1.  BUILD A COMPLETE TWO-LEVEL TOY DATASET
-# -----------------------------------------------------------------------------
-# 40 clusters x 15 people = 600 observations.
-#
-# Level 2: cluster_id
-# Level 1: individual rows within each cluster
-#
-# The data-generating model is:
-#
-#   x_ij = 0.5*z_ij + b_xj + e_xij
-#
-#   y_ij = 2 + 0.8*x_ij + 1.5*z_ij + b_yj + e_yij
-#
-# where b_xj and b_yj are cluster-specific random intercepts. Our substantive
-# analysis question is the fixed effect of x on y. Its TRUE value is 0.8.
-#
-# `z` and `y` remain fully observed. We create missingness only in `x`, just as
-# in the attached MICE example. Although y is complete, it belongs in jomo's
-# joint response matrix Y so its association with x helps impute missing x.
-# =============================================================================
-
-n_clusters <- 40L
-people_per_cluster <- 15L
+n_clusters <- 40
+people_per_cluster <- 25
 n <- n_clusters * people_per_cluster
 
-cluster_number <- rep(seq_len(n_clusters), each = people_per_cluster)
+cluster_number <- rep(1:n_clusters, each = people_per_cluster)
 cluster_id <- factor(cluster_number)
 
-# Separate cluster effects for x and for the residual part of y.
 cluster_effect_x <- rnorm(n_clusters, mean = 0, sd = 3)
 cluster_effect_y <- rnorm(n_clusters, mean = 0, sd = 4)
 
 z <- rnorm(n, mean = 50, sd = 10)
-x <- 0.5 * z + cluster_effect_x[cluster_number] + rnorm(n, 0, 5)
-y <- 2 + 0.8 * x + 1.5 * z +
-  cluster_effect_y[cluster_number] + rnorm(n, 0, 3)
 
-# An extra binary variable is generated now but ignored in the main example.
-# It is used only if RUN_CATEGORICAL_EXTENSION is changed to TRUE in Section 11.
+x <- 0.5 * z +
+  cluster_effect_x[cluster_number] +
+  rnorm(n, mean = 0, sd = 5)
+
+y <- 2 + 0.8 * x + 1.5 * z +
+  cluster_effect_y[cluster_number] +
+  rnorm(n, mean = 0, sd = 3)
+
+# smoke is used only in the optional categorical section at the end.
 p_smoke <- plogis(-0.5 + 0.03 * (z - 50) + 0.04 * (x - mean(x)))
 smoke <- factor(
   rbinom(n, size = 1, prob = p_smoke),
@@ -128,917 +102,688 @@ smoke <- factor(
   labels = c("no", "yes")
 )
 
-full <- data.frame(
-  cluster_id = cluster_id,
-  x = x,
-  y = y,
-  z = z,
-  smoke = smoke
+full <- data.frame(cluster_id, x, y, z, smoke)
+
+cat("\n=== Section 1: complete clustered dataset ===\n")
+print(head(full))
+cat("\nRows:", nrow(full),
+    "| clusters:", nlevels(full$cluster_id),
+    "| observations per cluster:", people_per_cluster, "\n")
+
+# The complete-data analysis is our best benchmark for this particular sample.
+# The number 0.8 is the population-generating parameter, while complete_beta_x
+# is what we would have estimated if no x values had been deleted. Later, JOMO
+# should recover the complete-data result as closely as possible while also
+# accounting for uncertainty about the missing values.
+true_beta_x <- 0.8
+
+complete_model <- lmer(
+  y ~ x + z + (1 | cluster_id),
+  data = full,
+  REML = FALSE
 )
 
-TRUE_BETA_X <- 0.8
+complete_beta_x <- fixef(complete_model)["x"]
+complete_se_x <- sqrt(vcov(complete_model)["x", "x"])
 
-cat("\n=== Section 1: the complete clustered toy dataset ===\n")
-print(head(full, 4))
-cat(sprintf("\nRows: %d | clusters: %d | rows per cluster: %d\n",
-            nrow(full), nlevels(full$cluster_id), people_per_cluster))
+cat("\nGenerating beta_x:", true_beta_x, "\n")
+cat("Complete-data estimate:", round(complete_beta_x, 3), "\n")
 
 
 # =============================================================================
-# 2.  IMPOSE MISSINGNESS ON x
+# 2. MAKE x MISSING UNDER MAR
 # -----------------------------------------------------------------------------
-# The probability that x is missing is:
+# We deliberately hide some x values so that the original values remain known
+# to us for evaluation. In real data, the missing values would be unknown.
 #
-#   MCAR: unrelated to every variable (a constant-probability coin flip).
+# The probability that x is missing depends on y and z. Both variables remain
+# fully observed. Therefore, once we condition on y and z, the missingness does
+# not depend on the unseen value of x; this is a Missing At Random (MAR)
+# mechanism.
 #
-#   MAR : related to fully OBSERVED y and z. This is a stronger teaching
-#         example than making missingness depend only on z: selection on the
-#         outcome can bias the complete-case regression, while jomo can use
-#         y and z to recover the missing x distribution.
+# y receives most of the weight in mar_score. Consequently, missingness is
+# related to the outcome, which can make complete-case analysis less reliable.
+# JOMO is given both y and z and can use that information during imputation.
 #
-#   MNAR: related to x itself. Once x vanishes, the variable driving its
-#         missingness is unobserved. Ordinary MAR-based jomo cannot generally
-#         repair that without an explicit MNAR sensitivity model.
-#
-# Each scenario targets approximately 30% missingness.
+# scale() standardizes y and z before combining them so that their different
+# units do not determine their influence. plogis() converts the score into a
+# probability between zero and one. The intercept of -1 produces approximately
+# 30% missingness, although the realized percentage varies randomly.
 # =============================================================================
 
-# Convert an arbitrary score into logistic probabilities whose mean is exactly
-# `target` before the random missingness draws are made.
-probabilities_with_target_mean <- function(score, target = 0.30) {
-  score <- as.numeric(scale(score))
-  intercept <- uniroot(
-    function(a) mean(plogis(a + score)) - target,
-    interval = c(-20, 20)
-  )$root
-  plogis(intercept + score)
-}
+mar_score <- 0.85 * as.numeric(scale(y)) +
+  0.15 * as.numeric(scale(z))
 
-make_x_missing <- function(data, probability, seed) {
-  stopifnot(length(probability) == nrow(data))
-  set.seed(seed)
-  out <- data
-  remove_x <- runif(nrow(data)) < probability
-  out$x[remove_x] <- NA_real_
-  out
-}
+p_x_missing <- plogis(-1 + mar_score)
+remove_x <- runif(n) < p_x_missing
 
-# MCAR: constant missingness probability.
-p_mcar <- rep(0.30, n)
+dat_mar <- full
+dat_mar$x[remove_x] <- NA
 
-# MAR: depends on observed y and z. y receives most of the weight because
-# outcome-dependent selection makes the complete-case problem easy to see.
-mar_score <- 0.85 * as.numeric(scale(y)) + 0.15 * as.numeric(scale(z))
-p_mar <- probabilities_with_target_mean(mar_score, target = 0.30)
+cat("\nMissing x:", sum(is.na(dat_mar$x)), "of", n, "rows\n")
+cat("Percent missing:", round(100 * mean(is.na(dat_mar$x)), 1), "%\n")
 
-# MNAR: depends on the value of x that may become unobserved.
-p_mnar <- probabilities_with_target_mean(x, target = 0.30)
 
-dat_mcar <- make_x_missing(full, p_mcar, seed = 101)
-dat_mar <- make_x_missing(full, p_mar, seed = 102)
-dat_mnar <- make_x_missing(full, p_mnar, seed = 103)
+# =============================================================================
+# 3. WHAT JOMO IS DOING
+# -----------------------------------------------------------------------------
+# JOMO stands for Joint Modelling Multiple Imputation. The word "joint" is the
+# key distinction. MICE generally cycles through variables and specifies a
+# separate conditional regression for each incomplete variable. JOMO instead
+# assumes that the variables in Y arise together from one multivariate model.
+#
+# Here, y and x are modeled jointly. Although y is complete, its covariance
+# with x helps JOMO predict the missing x values. In other words, y does not
+# need to be missing to be useful inside Y.
+#
+# Supplying cluster membership tells JOMO to estimate both within-cluster and
+# between-cluster variation. The joint model can be summarized as:
+#
+#   (y_ij, x_ij)' = fixed effects of z + cluster random effects + residuals
+#
+# JOMO estimates covariance matrices for both the cluster random effects and
+# the individual residuals. Those covariance matrices describe how y and x
+# move together within clusters and between clusters.
+#
+# Estimation uses Markov chain Monte Carlo (MCMC). Conceptually, each iteration
+# cycles through draws of:
+#   - the missing x values given the current parameters and observed data;
+#   - fixed-effect coefficients;
+#   - cluster-specific random effects;
+#   - within-cluster and between-cluster covariance matrices.
+#
+# Repeating these steps creates a Markov chain whose stable distribution is the
+# posterior distribution under the joint model. Final imputations are draws
+# from that distribution rather than single deterministic predictions.
+#
+# JOMO only creates the completed datasets. It does not by itself produce the
+# final substantive coefficient of x. We obtain that coefficient later by
+# fitting the analysis model to every completed dataset and pooling the fits.
+# =============================================================================
 
-cat("\n=== Section 2: how much x is missing in each scenario ===\n")
-cat(sprintf("MCAR: %d/%d (%.1f%%) missing\n",
-            sum(is.na(dat_mcar$x)), n, 100 * mean(is.na(dat_mcar$x))))
-cat(sprintf("MAR : %d/%d (%.1f%%) missing\n",
-            sum(is.na(dat_mar$x)), n, 100 * mean(is.na(dat_mar$x))))
-cat(sprintf("MNAR: %d/%d (%.1f%%) missing\n",
-            sum(is.na(dat_mnar$x)), n, 100 * mean(is.na(dat_mnar$x))))
 
-# A compact missingness-pattern table without requiring the mice package.
-cat("\nMissingness pattern for the MAR data:\n")
-print(
-  as.data.frame(
-    table(
-      y_observed = !is.na(dat_mar$y),
-      x_observed = !is.na(dat_mar$x),
-      z_observed = !is.na(dat_mar$z)
-    )
-  )
+# =============================================================================
+# 4. CREATE THE JOMO INPUTS
+# -----------------------------------------------------------------------------
+# Native JOMO does not use one analysis-style formula. Instead, we explicitly
+# construct the pieces of the joint imputation model.
+#
+# Y = variables modeled jointly. Missing values are allowed in Y. x belongs
+#     here because it is incomplete. y also belongs here because its covariance
+#     with x supplies predictive information about the missing x values.
+#
+# X = fully observed fixed-effect predictors for the joint outcomes. We include
+#     an explicit intercept and z. Missing values are not allowed in X because
+#     JOMO conditions on these predictors rather than imputing them in this
+#     model. x is not placed in X because it is itself an incomplete joint
+#     outcome.
+#
+# clus = one cluster identifier per row. Supplying clus activates JOMO's
+#        two-level model and allows different clusters to have different random
+#        intercepts.
+#
+# JOMO also has an argument called Z for the random-effect design matrix. We
+# omit it here, so JOMO uses a column of ones: a random intercept for y and a
+# random intercept for x. A more advanced model could supply Z to request
+# random slopes.
+# =============================================================================
+
+Y <- data.frame(
+  y = dat_mar$y,
+  x = dat_mar$x
 )
 
+X <- data.frame(
+  intercept = rep(1, n),
+  z = dat_mar$z
+)
+
+clus <- data.frame(
+  cluster_id = dat_mar$cluster_id
+)
+
+cat("\n=== Section 4: JOMO input dimensions ===\n")
+cat("Y:", nrow(Y), "rows x", ncol(Y), "joint outcomes\n")
+cat("X:", nrow(X), "rows x", ncol(X), "fixed-effect columns\n")
+cat("Clusters:", length(unique(clus$cluster_id)), "\n")
+
+# Expected dimensions are 1,000 x 2 for both Y and X, with 40 clusters. When
+# the sampler runs, JOMO should report jomo1rancon: "ran" indicates random
+# effects and "con" indicates that all joint outcomes are continuous.
+
 
 # =============================================================================
-# 3.  DEFINE THE SUBSTANTIVE ANALYSIS AND THE BENCHMARKS
+# 5. CHECK MCMC CONVERGENCE
 # -----------------------------------------------------------------------------
-# The substantive model is a random-intercept linear mixed model:
+# Before using draws as imputations, we need evidence that the Markov chain has
+# reached a stable region and is mixing adequately. If the chain is still
+# drifting from its starting values, the resulting imputations may depend too
+# heavily on initialization rather than the intended posterior distribution.
 #
-#   y ~ x + z + (1 | cluster_id)
+# jomo.MCMCchain() runs the same underlying sampler used for imputation but
+# returns its parameter history for diagnostic inspection. It does not create
+# the final five completed datasets used in the analysis.
 #
-# For every missingness scenario we compare:
+# JOMO estimates many parameters, so a full analysis should inspect several of
+# them. For a manageable teaching example, we select three representative
+# chains:
+#   - beta_trace: a fixed effect describing the relationship between z and x;
+#   - level1_covariance_trace: association between y and x among individuals
+#     after accounting for fixed effects and cluster random effects;
+#   - level2_covariance_trace: association between the cluster random effects
+#     for y and x.
 #
-#   (A) COMPLETE DATA : model fitted before any values were removed.
-#   (B) COMPLETE CASE : rows with missing x are silently discarded.
-#   (C) JOMO          : fit the model in each imputation and pool the results.
-#
-# The complete-data estimate is not exactly 0.8 because a finite simulated
-# sample contains sampling noise. It is the fairest practical benchmark for
-# judging what the missing-data methods recovered.
-# =============================================================================
-
-fit_analysis_model <- function(data) {
-  lme4::lmer(
-    y ~ x + z + (1 | cluster_id),
-    data = data,
-    REML = FALSE,
-    na.action = na.omit,
-    control = lme4::lmerControl(optimizer = "bobyqa")
-  )
-}
-
-extract_x_estimate <- function(model) {
-  coefficient_table <- summary(model)$coefficients
-  c(
-    beta_x = unname(coefficient_table["x", "Estimate"]),
-    se = unname(coefficient_table["x", "Std. Error"])
-  )
-}
-
-fit_slope <- function(data) {
-  extract_x_estimate(fit_analysis_model(data))
-}
-
-truth <- fit_slope(full)
-
-cat("\n=== Section 3: complete-data benchmark ===\n")
-cat(sprintf("Generating beta_x: %.3f\n", TRUE_BETA_X))
-cat(sprintf("Complete-data estimate: %.3f (SE %.3f)\n",
-            truth["beta_x"], truth["se"]))
-
-
-# =============================================================================
-# 4.  TRANSLATE THE DATA INTO JOMO'S INPUTS
-# -----------------------------------------------------------------------------
-# Native jomo uses matrices/data frames rather than one formula:
-#
-#   Y    : joint outcomes. Put incomplete variables here. Fully observed y is
-#          also placed here so its covariance with x helps impute x.
-#
-#   X    : fully observed fixed-effect predictors of every joint outcome.
-#          Missing values are NOT allowed. An intercept is explicit.
-#
-#   Z    : predictors attached to random effects. We omit it, so jomo uses its
-#          default column of 1s: a random intercept for every joint outcome.
-#
-#   clus : cluster membership. Supplying this makes the umbrella jomo()
-#          function select a two-level imputation engine.
-#
-# Our joint imputation model is therefore:
-#
-#   (y_ij, x_ij)' = B'(1, z_ij) + u_j + e_ij
-#
-# with multivariate-normal level-2 random effects u_j and level-1 residuals
-# e_ij. jomo estimates both covariance matrices.
-# =============================================================================
-
-make_jomo_inputs <- function(data, include_smoke = FALSE) {
-  if (include_smoke) {
-    Y <- data.frame(y = data$y, x = data$x, smoke = data$smoke)
-  } else {
-    Y <- data.frame(y = data$y, x = data$x)
-  }
-
-  X <- data.frame(
-    intercept = rep(1, nrow(data)),
-    z = data$z
-  )
-
-  clus <- data.frame(cluster_id = data$cluster_id)
-
-  stopifnot(
-    !anyNA(X),
-    !anyNA(clus),
-    is.numeric(Y$y),
-    is.numeric(Y$x)
-  )
-
-  list(Y = Y, X = X, clus = clus)
-}
-
-inputs_mar <- make_jomo_inputs(dat_mar)
-
-cat("\n=== Section 4: jomo input dimensions for MAR ===\n")
-cat(sprintf("Y: %d rows x %d joint outcomes\n",
-            nrow(inputs_mar$Y), ncol(inputs_mar$Y)))
-cat(sprintf("X: %d rows x %d fixed-effect predictors\n",
-            nrow(inputs_mar$X), ncol(inputs_mar$X)))
-cat(sprintf("Clusters: %d\n", nlevels(factor(inputs_mar$clus[, 1]))))
-
-
-# =============================================================================
-# 5.  DRY RUN: CHECK THAT JOMO IS FITTING THE INTENDED MODEL
-# -----------------------------------------------------------------------------
-# The package authors recommend a very short .MCMCchain run before spending
-# time on the real sampler. It answers structural questions:
-#
-#   - Did jomo recognize the data as clustered?
-#   - Did it recognize two continuous joint outcomes?
-#   - Are the fixed-effect and covariance arrays the expected dimensions?
-#
-# Two iterations are NOT enough for convergence. This is only a software/model
-# specification check.
+# Covariance parameters are included because they can mix more slowly than
+# ordinary regression coefficients and are central to multilevel imputation.
 # =============================================================================
 
 set.seed(500)
-dry_run <- jomo::jomo.MCMCchain(
-  Y = inputs_mar$Y,
-  X = inputs_mar$X,
-  clus = inputs_mar$clus,
-  nburn = 2L,
+
+diagnostic_chain <- jomo.MCMCchain(
+  Y = Y,
+  X = X,
+  clus = clus,
+  nburn = 5000,
   output = 0
 )
 
-cat("\n=== Section 5: dry-run output objects ===\n")
-dry_dimensions <- lapply(
-  dry_run[c("collectbeta", "collectomega", "collectu", "collectcovu")],
-  dim
+beta_trace <- as.numeric(
+  diagnostic_chain$collectbeta["z", "x", ]
 )
-print(dry_dimensions)
-cat("Expected: beta, level-1 covariance, random effects, and level-2 covariance.\n")
+
+level1_covariance_trace <- as.numeric(
+  diagnostic_chain$collectomega["y", "x", ]
+)
+
+level2_covariance_trace <- as.numeric(
+  diagnostic_chain$collectcovu["y*Z1", "x*Z1", ]
+)
+
+# A trace plot displays the sampled parameter value at every iteration. A
+# reassuring chain resembles a stable, irregular band: it moves around its
+# typical value without a continuing upward trend, downward trend, or long
+# periods stuck at one value. The band does not need to be perfectly smooth.
+trace_plot_file <- file.path(
+  output_directory,
+  "jomo_trace_plots_MAR.png"
+)
+
+png(trace_plot_file, width = 1200, height = 900, res = 120)
+par(mfrow = c(3, 1))
+plot(beta_trace, type = "l", main = "Fixed effect: z -> x")
+plot(level1_covariance_trace, type = "l", main = "Level-1 covariance: y, x")
+plot(level2_covariance_trace, type = "l", main = "Level-2 covariance: y, x")
+dev.off()
+
+# An autocorrelation function (ACF) plot measures how strongly a draw is related
+# to earlier draws. High autocorrelation at many lags means that the chain is
+# moving slowly and contains less independent information. We want the bars to
+# decline toward zero. This helps choose nbetween, the number of MCMC updates
+# separating two saved completed datasets.
+acf_plot_file <- file.path(
+  output_directory,
+  "jomo_acf_plots_MAR.png"
+)
+
+png(acf_plot_file, width = 1200, height = 900, res = 120)
+par(mfrow = c(3, 1))
+acf(beta_trace, lag.max = 100, main = "ACF: fixed effect")
+acf(level1_covariance_trace, lag.max = 100, main = "ACF: level 1")
+acf(level2_covariance_trace, lag.max = 100, main = "ACF: level 2")
+dev.off()
+
+cat("\n=== Section 5: saved MCMC diagnostics ===\n")
+cat("Trace plots:", normalizePath(trace_plot_file), "\n")
+cat("ACF plots  :", normalizePath(acf_plot_file), "\n")
+cat("Trace file exists:", file.exists(trace_plot_file), "\n")
+cat("ACF file exists  :", file.exists(acf_plot_file), "\n")
+
+# The Geweke diagnostic compares the mean of an early portion of a chain with
+# the mean of a later portion and reports a standardized z-score. A value within
+# roughly -1.96 to 1.96 is a useful screen for stability. It is not proof of
+# convergence: it examines only one chain at a time and can miss problems that
+# are visible in the trace or ACF plots. The numerical result and plots should
+# therefore be interpreted together.
+geweke_results <- c(
+  fixed_effect = geweke.diag(mcmc(beta_trace))$z,
+  level1_covariance = geweke.diag(mcmc(level1_covariance_trace))$z,
+  level2_covariance = geweke.diag(mcmc(level2_covariance_trace))$z
+)
+
+cat("\nGeweke z-scores:\n")
+print(round(geweke_results, 3))
 
 
 # =============================================================================
-# 6.  RUN A LONGER MCMC CHAIN AND CHECK CONVERGENCE
+# 6. CREATE FIVE IMPUTED DATASETS
 # -----------------------------------------------------------------------------
-# WHAT JOMO DOES UNDER THE HOOD:
-#   - Unlike MICE, it does not start with a separate regression for each
-#     incomplete variable. It posits ONE joint multivariate model.
-#   - A Gibbs/data-augmentation sampler repeatedly draws model parameters,
-#     covariance matrices, random effects, and missing values from their
-#     conditional distributions under that joint model.
-#   - The sampler must reach its stationary distribution before we save an
-#     imputed dataset.
+# This is the actual multiple-imputation run. Its three most important tuning
+# arguments have different jobs:
 #
-# The .MCMCchain function saves parameter draws instead of returning the final
-# multiple imputations. We inspect three representative chains:
+# nburn = MCMC iterations completed before the first imputation is retained.
+#         These early iterations allow the sampler to move away from its
+#         starting values. They are not treated as completed datasets.
 #
-#   beta(z -> x)           : a fixed-effect parameter
-#   residual cov(y, x)     : a level-1 covariance parameter
-#   cluster cov(y, x)      : a level-2 covariance parameter
+# nbetween = MCMC iterations separating successive saved imputations. Spacing
+#            reduces dependence between the completed datasets. The ACF plots
+#            provide information for this choice.
 #
-# Good signs: no drift, stable variation, reasonable mixing, and an ACF that
-# falls toward zero. Inspect several parameters in a real analysis, especially
-# covariance parameters, which often mix more slowly than fixed effects.
+# nimp = number of completed datasets retained. Each dataset contains a
+#        different plausible draw for every missing value. Five is convenient
+#        for learning, but a final study would usually use more to reduce Monte
+#        Carlo error in the pooled estimates and FMI.
+#
+# meth = "common" assumes that the level-1 residual covariance matrix is shared
+# across clusters. This is a simpler and more stable choice for the toy example.
+# It does not mean that every cluster has the same random intercept.
 # =============================================================================
 
-cat(sprintf("\n=== Section 6: running %d diagnostic MCMC iterations (MAR) ===\n",
-            DIAGNOSTIC_ITERATIONS))
+set.seed(600)
 
-set.seed(501)
-diagnostic_mar <- jomo::jomo.MCMCchain(
-  Y = inputs_mar$Y,
-  X = inputs_mar$X,
-  clus = inputs_mar$clus,
-  nburn = DIAGNOSTIC_ITERATIONS,
+imputed_long <- jomo(
+  Y = Y,
+  X = X,
+  clus = clus,
+  nburn = 1000,
+  nbetween = 1000,
+  nimp = 5,
+  meth = "common",
   output = 0
 )
 
-diagnostic_traces <- list(
-  `fixed effect: z -> x` = as.numeric(
-    diagnostic_mar$collectbeta["z", "x", ]
-  ),
-  `level-1 covariance: y,x` = as.numeric(
-    diagnostic_mar$collectomega["y", "x", ]
-  ),
-  `level-2 covariance: y,x` = as.numeric(
-    diagnostic_mar$collectcovu["y*Z1", "x*Z1", ]
-  )
+# JOMO returns a stacked, or long-format, object. Imputation 0 reproduces the
+# original incomplete data, while Imputations 1-5 contain completed versions.
+# With 1,000 original observations, each label should therefore appear 1,000
+# times. The completed datasets agree on observed values but may disagree on
+# imputed values.
+cat("\n=== Section 6: rows in each JOMO dataset ===\n")
+print(table(imputed_long$Imputation))
+
+# jomo2mitml.list() converts that stacked output into a more analysis-friendly
+# list, analogous to the imputation-list object used in the SMC-FCS example.
+# Each list element is one ordinary completed data frame.
+imputed_sets <- jomo2mitml.list(imputed_long)
+
+imp1 <- imputed_sets[[1]]
+imp2 <- imputed_sets[[2]]
+imp3 <- imputed_sets[[3]]
+imp4 <- imputed_sets[[4]]
+imp5 <- imputed_sets[[5]]
+
+
+# =============================================================================
+# 7. INSPECT, ANALYZE, AND POOL
+# -----------------------------------------------------------------------------
+# Multiple imputation is not finished when JOMO returns five datasets. We must:
+#   1. verify that the completed data behave as intended;
+#   2. fit the same substantive model in every dataset; and
+#   3. combine those model results rather than choosing one completed dataset.
+#
+# Two basic integrity checks come first. Every originally missing x should be
+# filled, and every originally observed x should remain exactly unchanged.
+# JOMO is meant to replace NAs, not revise known measurements.
+# =============================================================================
+
+missing_rows <- which(is.na(dat_mar$x))
+observed_rows <- which(!is.na(dat_mar$x))
+
+# Each row below corresponds to one originally missing x cell, and each column
+# is its value in a different imputation. The columns should not be identical.
+# Their disagreement is intentional: it represents uncertainty about what the
+# missing value could have been given y, z, and the cluster structure.
+x_imputations <- cbind(
+  imputation_1 = imp1$x[missing_rows],
+  imputation_2 = imp2$x[missing_rows],
+  imputation_3 = imp3$x[missing_rows],
+  imputation_4 = imp4$x[missing_rows],
+  imputation_5 = imp5$x[missing_rows]
 )
 
-png("jomo_diagnostics_trace_MAR.png", width = 1000, height = 900)
-par(mfrow = c(3, 1), mar = c(3.5, 4.2, 2.5, 1))
-for (trace_name in names(diagnostic_traces)) {
-  plot(
-    diagnostic_traces[[trace_name]],
-    type = "l",
-    xlab = "MCMC iteration",
-    ylab = "Parameter draw",
-    main = trace_name
-  )
-}
-dev.off()
+cat("\n=== Section 7: first missing x values across imputations ===\n")
+print(head(round(x_imputations, 2)))
 
-png("jomo_diagnostics_acf_MAR.png", width = 1000, height = 900)
-par(mfrow = c(3, 1), mar = c(3.5, 4.2, 2.5, 1))
-for (trace_name in names(diagnostic_traces)) {
-  acf(
-    diagnostic_traces[[trace_name]],
-    lag.max = 100,
-    main = paste("ACF -", trace_name)
-  )
-}
-dev.off()
+# Expected results are TRUE and 0. A nonzero change to observed x would indicate
+# that the extraction or row alignment needs investigation. A tiny value caused
+# only by floating-point representation could be harmless, but JOMO normally
+# retains observed values exactly.
+all_x_filled <- all(!is.na(x_imputations))
 
-# Show the remaining autocorrelation at the proposed distance between saved
-# imputations. Values near zero suggest that N_BETWEEN is amply spaced for the
-# inspected parameters. Always judge this together with the plots.
-acf_at_lag <- function(x, lag) {
-  as.numeric(acf(x, plot = FALSE, lag.max = lag)$acf[lag + 1L])
-}
+largest_change_to_observed_x <- max(abs(c(
+  imp1$x[observed_rows] - dat_mar$x[observed_rows],
+  imp2$x[observed_rows] - dat_mar$x[observed_rows],
+  imp3$x[observed_rows] - dat_mar$x[observed_rows],
+  imp4$x[observed_rows] - dat_mar$x[observed_rows],
+  imp5$x[observed_rows] - dat_mar$x[observed_rows]
+)))
 
-spacing_acf <- vapply(
-  diagnostic_traces,
-  acf_at_lag,
-  numeric(1),
-  lag = N_BETWEEN
+cat("\nAll missing x values filled:", all_x_filled, "\n")
+cat("Largest change to an observed x:",
+    format(largest_change_to_observed_x, scientific = FALSE), "\n")
+
+# We now fit the substantive model (the model answering the scientific
+# question) to all five datasets. It must be identical across imputations.
+# Changing the formula from one dataset to another would make pooling
+# meaningless. JOMO names the cluster variable clus in its completed output,
+# so the random-intercept term uses (1 | clus) here.
+models <- with(
+  imputed_sets,
+  lmer(y ~ x + z + (1 | clus), REML = FALSE)
 )
 
-cat(sprintf("\nAutocorrelation at proposed nbetween = %d:\n", N_BETWEEN))
-print(round(spacing_acf, 3))
+# This distinction is important: JOMO's direct output is imputed data, not the
+# final beta_x. The five lmer models estimate beta_x. Rubin's rules then combine
+# those five estimates into the result attributed to the JOMO workflow.
+# testEstimates() performs package-based pooling for all fixed effects and
+# reports pooled estimates, standard errors, degrees of freedom, relative
+# increases in variance, and fractions of missing information.
+pooled_models <- testEstimates(models)
 
-# Geweke is optional and complements rather than replaces trace/ACF review.
-# A rough screening rule is |z| < 1.96, but passing it does not prove that the
-# whole high-dimensional sampler has converged.
-if (requireNamespace("coda", quietly = TRUE)) {
-  geweke_z <- vapply(
-    diagnostic_traces,
-    function(x) coda::geweke.diag(coda::mcmc(x))$z,
-    numeric(1)
-  )
-  cat("\nOptional Geweke z-scores:\n")
-  print(round(geweke_z, 3))
-  cat("Use |z| < 1.96 only as a rough screen; inspect the plots too.\n")
+cat("\n=== Package-pooled model results ===\n")
+print(pooled_models)
+
+# We also extract beta_x and its estimated sampling variance from every model so
+# the pooling calculation is visible rather than hidden inside testEstimates().
+beta_x_each <- c(
+  fixef(models[[1]])["x"],
+  fixef(models[[2]])["x"],
+  fixef(models[[3]])["x"],
+  fixef(models[[4]])["x"],
+  fixef(models[[5]])["x"]
+)
+
+variance_x_each <- c(
+  vcov(models[[1]])["x", "x"],
+  vcov(models[[2]])["x", "x"],
+  vcov(models[[3]])["x", "x"],
+  vcov(models[[4]])["x", "x"],
+  vcov(models[[5]])["x", "x"]
+)
+
+cat("\nThe five x estimates before pooling:\n")
+print(round(beta_x_each, 4))
+
+# Rubin's rules use four central quantities:
+#
+# Qbar = average of the five beta_x estimates.
+# Ubar = average variance within the five fitted models.
+# B    = variance of beta_x across the five imputations.
+# T    = Ubar + (1 + 1/m)*B, the total pooled variance.
+#
+# Ubar represents ordinary complete-data sampling uncertainty. B represents
+# additional uncertainty caused by not knowing the missing x values. The pooled
+# standard error is sqrt(T), so a single imputation would generally understate
+# uncertainty by omitting the between-imputation component.
+m <- length(beta_x_each)
+Qbar <- mean(beta_x_each)
+Ubar <- mean(variance_x_each)
+B <- var(beta_x_each)
+total_variance <- Ubar + (1 + 1 / m) * B
+jomo_pooled_se <- sqrt(total_variance)
+
+if (B > .Machine$double.eps) {
+  relative_increase <- ((1 + 1 / m) * B) / Ubar
+  jomo_df <- (m - 1) * (1 + 1 / relative_increase)^2
+  jomo_fmi <- (relative_increase + 2 / (jomo_df + 3)) /
+    (relative_increase + 1)
+  critical_value <- qt(0.975, df = jomo_df)
 } else {
-  cat("\nOptional Geweke diagnostic skipped: package 'coda' is not installed.\n")
+  jomo_df <- Inf
+  jomo_fmi <- 0
+  critical_value <- qnorm(0.975)
 }
 
-cat("\nSaved jomo_diagnostics_trace_MAR.png and jomo_diagnostics_acf_MAR.png\n")
-cat(sprintf(
-  "Demo settings used below: nburn = %d, nbetween = %d, nimp = %d.\n",
-  N_BURN, N_BETWEEN, N_IMPUTATIONS
-))
-cat("Change these only after reviewing your own chain diagnostics.\n")
+jomo_ci <- Qbar + c(-1, 1) * critical_value * jomo_pooled_se
 
+cat("\nExplicit JOMO result for the x coefficient:\n")
+cat("JOMO pooled beta_x:", round(Qbar, 4), "\n")
+cat("Pooled SE         :", round(jomo_pooled_se, 4), "\n")
+cat("95% CI            :", round(jomo_ci[1], 4), "to",
+    round(jomo_ci[2], 4), "\n")
+cat("Degrees of freedom:", round(jomo_df, 2), "\n")
+cat("FMI               :", round(jomo_fmi, 3), "\n")
 
-# =============================================================================
-# 7.  GENERATE MULTIPLE IMPUTATIONS WITH JOMO
-# -----------------------------------------------------------------------------
-# `nburn`    = MCMC updates before the first saved completed dataset.
-# `nbetween` = MCMC updates between successive completed datasets.
-# `nimp`     = number of completed datasets retained.
+# Finally, compare three analyses:
+#   - complete data: the benchmark before x was hidden;
+#   - complete case: uses only rows where x remained observed;
+#   - JOMO pooled: uses all rows after multiple imputation and carries the
+#     imputation uncertainty into its standard error.
 #
-# WHY nimp = 5 INSTEAD OF 1:
-# A single completed dataset hides uncertainty about the missing values.
-# Multiple datasets are allowed to disagree. Rubin's rules later combine:
-#
-#   - within-imputation uncertainty from each fitted model, and
-#   - between-imputation uncertainty from disagreement across imputations.
-#
-# Five is useful for a quick teaching example, not necessarily enough for the
-# final NHANES project. The final number should reflect missing information and
-# the desired Monte Carlo precision.
-# =============================================================================
+# The generating value 0.8 is the population target. The complete-data estimate
+# is the fairest benchmark for judging missing-data recovery in this particular
+# realized sample.
+complete_cases <- dat_mar[!is.na(dat_mar$x), ]
 
-run_jomo <- function(data, seed) {
-  inputs <- make_jomo_inputs(data)
-  set.seed(seed)
-
-  jomo::jomo(
-    Y = inputs$Y,
-    X = inputs$X,
-    clus = inputs$clus,
-    nburn = N_BURN,
-    nbetween = N_BETWEEN,
-    nimp = N_IMPUTATIONS,
-    meth = "common",  # common level-1 covariance matrix across clusters
-    output = 0
-  )
-}
-
-cat("\n=== Section 7: creating the final imputations ===\n")
-imp_mcar <- run_jomo(dat_mcar, seed = 701)
-imp_mar <- run_jomo(dat_mar, seed = 702)
-imp_mnar <- run_jomo(dat_mnar, seed = 703)
-
-cat("Created MCAR, MAR, and MNAR jomo objects.\n")
-
-# Native jomo returns LONG data:
-#   Imputation == 0 : original incomplete data
-#   Imputation == 1,...,5 : completed datasets
-cat("\nImputation labels in the MAR object:\n")
-print(table(imp_mar$Imputation))
-
-
-# =============================================================================
-# 8.  INSPECT THE COMPLETED DATASETS
-# -----------------------------------------------------------------------------
-# We split jomo's stacked output into a list, restore the analysis-friendly
-# cluster_id name, and then verify four basic properties:
-#
-#   1. all missing x values were filled,
-#   2. originally observed x values were not changed,
-#   3. imputations differ from one another, and
-#   4. the cluster structure is still present.
-# =============================================================================
-
-jomo_completed_list <- function(jomo_output) {
-  imputation_numbers <- sort(unique(
-    jomo_output$Imputation[jomo_output$Imputation > 0]
-  ))
-
-  completed <- lapply(imputation_numbers, function(k) {
-    out <- jomo_output[jomo_output$Imputation == k, , drop = FALSE]
-    out <- out[order(out$id), , drop = FALSE]
-    out$cluster_id <- factor(out$clus)
-    rownames(out) <- NULL
-    out
-  })
-
-  names(completed) <- paste0("imputation_", imputation_numbers)
-  completed
-}
-
-completed_mcar <- jomo_completed_list(imp_mcar)
-completed_mar <- jomo_completed_list(imp_mar)
-completed_mnar <- jomo_completed_list(imp_mnar)
-
-mar_missing_rows <- which(is.na(dat_mar$x))
-mar_observed_rows <- which(!is.na(dat_mar$x))
-
-imputed_x_mar <- vapply(
-  completed_mar,
-  function(data) data$x[mar_missing_rows],
-  numeric(length(mar_missing_rows))
+complete_case_model <- lmer(
+  y ~ x + z + (1 | cluster_id),
+  data = complete_cases,
+  REML = FALSE
 )
 
-cat("\n=== Section 8: first missing x cells across five MAR imputations ===\n")
-print(round(head(imputed_x_mar, 6), 2))
+complete_case_beta_x <- unname(fixef(complete_case_model)["x"])
+complete_case_se_x <- sqrt(vcov(complete_case_model)["x", "x"])
 
-all_x_filled <- all(vapply(
-  completed_mar,
-  function(data) !anyNA(data$x),
-  logical(1)
-))
+complete_ci <- unname(complete_beta_x) +
+  c(-1, 1) * qnorm(0.975) * complete_se_x
+complete_case_ci <- complete_case_beta_x +
+  c(-1, 1) * qnorm(0.975) * complete_case_se_x
 
-largest_change_to_observed_x <- max(vapply(
-  completed_mar,
-  function(data) max(abs(
-    data$x[mar_observed_rows] - dat_mar$x[mar_observed_rows]
+results_table <- data.frame(
+  method = c("complete data", "complete case", "JOMO pooled"),
+  beta_x = c(unname(complete_beta_x), complete_case_beta_x, Qbar),
+  se = c(complete_se_x, complete_case_se_x, jomo_pooled_se),
+  df = c(NA, NA, jomo_df),
+  fmi = c(NA, NA, jomo_fmi),
+  ci_low = c(complete_ci[1], complete_case_ci[1], jomo_ci[1]),
+  ci_high = c(complete_ci[2], complete_case_ci[2], jomo_ci[2]),
+  bias_from_0.8 = c(
+    unname(complete_beta_x) - true_beta_x,
+    complete_case_beta_x - true_beta_x,
+    Qbar - true_beta_x
+  ),
+  difference_from_complete = c(
+    0,
+    complete_case_beta_x - unname(complete_beta_x),
+    Qbar - unname(complete_beta_x)
+  )
+)
+
+display_results <- results_table
+display_results[, -1] <- round(display_results[, -1], 4)
+
+cat("\n=== FINAL COMPARISON: generating beta_x = 0.8 ===\n")
+print(display_results, row.names = FALSE)
+
+results_file <- file.path(output_directory, "jomo_x_coefficient_results.csv")
+write.csv(results_table, results_file, row.names = FALSE)
+cat("\nSaved coefficient results:", normalizePath(results_file), "\n")
+
+# What we want to see:
+#   - pooled x is reasonably close to the complete-data estimate and 0.8;
+#   - its confidence interval includes the complete-data estimate and ideally 0.8;
+#   - the five imputations differ, so between-imputation uncertainty is retained.
+#
+# FMI is the fraction of inferential uncertainty attributable to missing
+# information. It is not simply the percentage of x values that are missing.
+# One toy dataset demonstrates the process; repeated simulations would be
+# required to estimate bias, efficiency, and confidence-interval coverage.
+
+
+# =============================================================================
+# 8. OPTIONAL: ADD AN INCOMPLETE BINARY VARIABLE
+# -----------------------------------------------------------------------------
+# This section shows why JOMO is useful when a multilevel dataset mixes variable
+# types. We retain incomplete continuous x and additionally remove about 20% of
+# the binary smoke values. y, x, and smoke are placed in the same Y object so
+# JOMO can preserve their joint relationships while imputing both incomplete
+# variables.
+#
+# JOMO should now select jomo1ranmix: "mix" indicates a mixture of continuous
+# and categorical outcomes. It cannot model a factor with an ordinary normal
+# distribution directly. Instead, it assumes an unobserved continuous latent
+# variable underlying smoke. Values on one side of a threshold correspond to
+# "no" and values on the other side correspond to "yes." JOMO samples on that
+# latent scale and then converts draws back into the observed categories.
+#
+# If output is changed to 1, smoke.1 coefficients are on the latent-normal
+# scale, not a logistic-regression scale. Its level-1 variance is fixed at 1
+# for identification because the scale of an unobserved latent variable cannot
+# otherwise be uniquely determined. That fixed value is expected rather than a
+# warning sign.
+#
+# The goal is not to guess every hidden person's smoking status correctly. A
+# valid multiple-imputation procedure should reproduce the distribution and
+# relationships of smoking while expressing uncertainty through differences
+# among completed datasets.
+# =============================================================================
+
+mixed_data <- dat_mar
+smoke_truth <- mixed_data$smoke
+
+set.seed(800)
+remove_smoke <- runif(n) < 0.20
+mixed_data$smoke[remove_smoke] <- NA
+
+Y_mixed <- data.frame(
+  y = mixed_data$y,
+  x = mixed_data$x,
+  smoke = mixed_data$smoke
+)
+
+set.seed(801)
+
+imputed_mixed_long <- jomo(
+  Y = Y_mixed,
+  X = X,
+  clus = clus,
+  nburn = 1000,
+  nbetween = 1000,
+  nimp = 5,
+  meth = "common",
+  output = 0
+)
+
+mixed_sets <- jomo2mitml.list(imputed_mixed_long)
+
+mixed1 <- mixed_sets[[1]]
+mixed2 <- mixed_sets[[2]]
+mixed3 <- mixed_sets[[3]]
+mixed4 <- mixed_sets[[4]]
+mixed5 <- mixed_sets[[5]]
+
+observed_smoke_rows <- which(!is.na(mixed_data$smoke))
+
+# Both checks should be TRUE.
+all_smoke_filled <-
+  !anyNA(mixed1$smoke) && !anyNA(mixed2$smoke) &&
+  !anyNA(mixed3$smoke) && !anyNA(mixed4$smoke) &&
+  !anyNA(mixed5$smoke)
+
+observed_smoke_unchanged <-
+  all(as.character(mixed1$smoke[observed_smoke_rows]) ==
+        as.character(smoke_truth[observed_smoke_rows])) &&
+  all(as.character(mixed2$smoke[observed_smoke_rows]) ==
+        as.character(smoke_truth[observed_smoke_rows])) &&
+  all(as.character(mixed3$smoke[observed_smoke_rows]) ==
+        as.character(smoke_truth[observed_smoke_rows])) &&
+  all(as.character(mixed4$smoke[observed_smoke_rows]) ==
+        as.character(smoke_truth[observed_smoke_rows])) &&
+  all(as.character(mixed5$smoke[observed_smoke_rows]) ==
+        as.character(smoke_truth[observed_smoke_rows]))
+
+cat("\n=== Section 8: categorical-imputation checks ===\n")
+cat("All missing smoke values filled:", all_smoke_filled, "\n")
+cat("Observed smoke values unchanged:", observed_smoke_unchanged, "\n")
+
+# Because this is simulated data, smoke_truth retains the values that were
+# deliberately hidden. We compare the true complete distribution with each
+# completed dataset. In a real NHANES analysis, the hidden truth would not be
+# available; comparisons would instead use observed distributions, scientific
+# plausibility, relationships with other variables, and sensitivity checks.
+smoke_levels <- levels(smoke_truth)
+
+smoke_distribution_comparison <- rbind(
+  complete_truth = prop.table(table(
+    factor(smoke_truth, levels = smoke_levels)
   )),
-  numeric(1)
-))
-
-cat(sprintf("\nAll MAR x values filled: %s\n", all_x_filled))
-cat(sprintf("Largest change to an originally observed x: %.12f\n",
-            largest_change_to_observed_x))
-
-# A simple intraclass correlation (ICC) check for x. The five imputed ICCs do
-# not need to equal the complete-data ICC exactly, but they should retain the
-# clear within-cluster dependence instead of treating every row as independent.
-icc_x <- function(data) {
-  model <- lme4::lmer(
-    x ~ 1 + (1 | cluster_id),
-    data = data,
-    REML = TRUE,
-    na.action = na.omit,
-    control = lme4::lmerControl(optimizer = "bobyqa")
-  )
-  variance_table <- as.data.frame(lme4::VarCorr(model))
-  between <- variance_table$vcov[variance_table$grp == "cluster_id"][1]
-  within <- variance_table$vcov[variance_table$grp == "Residual"][1]
-  between / (between + within)
-}
-
-complete_icc <- icc_x(full)
-imputed_iccs <- vapply(completed_mar, icc_x, numeric(1))
-
-cat(sprintf("\nComplete-data ICC for x: %.3f\n", complete_icc))
-cat("ICC for x in each MAR imputation:\n")
-print(round(imputed_iccs, 3))
-
-# Compare both observed and truly missing x values with the pooled imputed
-# draws. Under MAR, the observed and imputed distributions need not be
-# identical: the missing rows were systematically selected using y and z.
-observed_x_mar <- dat_mar$x[mar_observed_rows]
-true_missing_x_mar <- full$x[mar_missing_rows]
-pooled_imputed_x_mar <- as.numeric(imputed_x_mar)
-
-png("jomo_imputed_vs_true_MAR.png", width = 1100, height = 500)
-par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
-
-plot(
-  density(observed_x_mar),
-  lwd = 2,
-  col = "steelblue",
-  main = "Observed vs imputed x (MAR)",
-  xlab = "x"
-)
-lines(density(pooled_imputed_x_mar), lwd = 2, col = "firebrick")
-legend(
-  "topright",
-  legend = c("Observed x", "Imputed x draws"),
-  col = c("steelblue", "firebrick"),
-  lwd = 2,
-  bty = "n"
-)
-
-plot(
-  density(true_missing_x_mar),
-  lwd = 2,
-  col = "darkgreen",
-  main = "Hidden truth vs imputed x (MAR)",
-  xlab = "x"
-)
-lines(density(pooled_imputed_x_mar), lwd = 2, col = "firebrick")
-legend(
-  "topright",
-  legend = c("True hidden x", "Imputed x draws"),
-  col = c("darkgreen", "firebrick"),
-  lwd = 2,
-  bty = "n"
-)
-
-dev.off()
-cat("\nSaved jomo_imputed_vs_true_MAR.png\n")
-
-
-# =============================================================================
-# 9.  FIT EACH IMPUTED DATASET AND POOL WITH RUBIN'S RULES
-# -----------------------------------------------------------------------------
-# The substantive analysis model is fitted separately to all five completed
-# datasets. Nothing is pooled until all five model fits exist.
-#
-# For the x coefficient:
-#
-#   Qbar = average of the five coefficient estimates
-#   Ubar = average of the five estimated variances (SE^2)
-#   B    = variance of the five coefficient estimates
-#   T    = Ubar + (1 + 1/m)*B
-#
-# The total SE is sqrt(T). The B term is the extra uncertainty caused by not
-# knowing the missing x values. A single imputation would omit that term.
-#
-# This helper implements the standard large-sample Rubin pooling formulas so
-# the arithmetic is visible. In the full project we can use mitml or another
-# tested pooling layer, especially for multi-parameter tests and small-sample
-# degrees-of-freedom adjustments.
-# =============================================================================
-
-fit_all_imputations <- function(completed_list) {
-  lapply(completed_list, fit_analysis_model)
-}
-
-pool_x_with_rubin <- function(fitted_models) {
-  m <- length(fitted_models)
-
-  estimates <- vapply(
-    fitted_models,
-    function(model) unname(lme4::fixef(model)["x"]),
-    numeric(1)
-  )
-
-  variances <- vapply(
-    fitted_models,
-    function(model) unname(as.matrix(stats::vcov(model))["x", "x"]),
-    numeric(1)
-  )
-
-  q_bar <- mean(estimates)
-  u_bar <- mean(variances)
-  b <- stats::var(estimates)
-  total_variance <- u_bar + (1 + 1 / m) * b
-  pooled_se <- sqrt(total_variance)
-
-  if (b <= .Machine$double.eps) {
-    relative_increase <- 0
-    df <- Inf
-    fmi <- 0
-  } else {
-    relative_increase <- ((1 + 1 / m) * b) / u_bar
-    df <- (m - 1) * (1 + 1 / relative_increase)^2
-    fmi <- (relative_increase + 2 / (df + 3)) /
-      (relative_increase + 1)
-  }
-
-  critical_value <- stats::qt(0.975, df = df)
-
-  list(
-    estimates = estimates,
-    variances = variances,
-    summary = c(
-      beta_x = q_bar,
-      se = pooled_se,
-      df = df,
-      fmi = fmi,
-      ci_low = q_bar - critical_value * pooled_se,
-      ci_high = q_bar + critical_value * pooled_se,
-      within_variance = u_bar,
-      between_variance = b,
-      total_variance = total_variance
-    )
-  )
-}
-
-fits_mcar <- fit_all_imputations(completed_mcar)
-fits_mar <- fit_all_imputations(completed_mar)
-fits_mnar <- fit_all_imputations(completed_mnar)
-
-pool_mcar <- pool_x_with_rubin(fits_mcar)
-pool_mar <- pool_x_with_rubin(fits_mar)
-pool_mnar <- pool_x_with_rubin(fits_mnar)
-
-# The same native jomo output can instead be handed to mitml. This is the
-# package-supported route to use later when you want more general pooled tests:
-
-if (requireNamespace("mitml", quietly = TRUE)) {
-  imp_mar_mitml <- mitml::jomo2mitml.list(imp_mar)
-  fits_mar_mitml <- with(
-    imp_mar_mitml,
-    lme4::lmer(y ~ x + z + (1 | clus), REML = FALSE)
-  )
-  print(mitml::testEstimates(fits_mar_mitml))
-}
-
-cat("\n=== Section 9: the five MAR estimates before pooling ===\n")
-print(round(pool_mar$estimates, 4))
-
-cat("\nMAR Rubin components:\n")
-cat(sprintf("Average estimate (Qbar)      : %.4f\n", pool_mar$summary["beta_x"]))
-cat(sprintf("Within-imputation variance  : %.6f\n",
-            pool_mar$summary["within_variance"]))
-cat(sprintf("Between-imputation variance : %.6f\n",
-            pool_mar$summary["between_variance"]))
-cat(sprintf("Total variance              : %.6f\n",
-            pool_mar$summary["total_variance"]))
-cat(sprintf("Pooled SE                   : %.4f\n", pool_mar$summary["se"]))
-cat(sprintf("Fraction missing information: %.3f\n", pool_mar$summary["fmi"]))
-
-
-# =============================================================================
-# 10. COMPARE COMPLETE DATA, COMPLETE CASES, AND JOMO
-# -----------------------------------------------------------------------------
-# What we expect across repeated simulations:
-#
-#   MCAR: complete cases and jomo are both approximately unbiased. Jomo can
-#         recover information and therefore may improve efficiency.
-#
-#   MAR : complete-case analysis can be biased here because whether x is
-#         observed depends on y. Jomo conditions on the observed y and z and
-#         should move the estimate back toward the complete-data result.
-#
-#   MNAR: ordinary jomo and complete-case analysis can both be biased. The
-#         missingness still depends on the unseen x after conditioning on the
-#         imputation variables. A plausible-looking SE cannot repair a wrong
-#         missingness assumption.
-#
-# One random toy sample will not reproduce the exact theoretical ordering every
-# time. Judge the pattern, not whether every printed decimal is perfect.
-# =============================================================================
-
-normal_ci <- function(estimate, se) {
-  estimate + c(-1, 1) * stats::qnorm(0.975) * se
-}
-
-comparison_rows <- function(scenario, incomplete_data, pooled_object) {
-  cc <- fit_slope(incomplete_data)
-  mi <- pooled_object$summary
-
-  truth_ci <- normal_ci(truth["beta_x"], truth["se"])
-  cc_ci <- normal_ci(cc["beta_x"], cc["se"])
-
-  rbind(
-    data.frame(
-      scenario = scenario,
-      method = "complete data",
-      beta_x = unname(truth["beta_x"]),
-      se = unname(truth["se"]),
-      df = NA_real_,
-      fmi = NA_real_,
-      ci_low = truth_ci[1],
-      ci_high = truth_ci[2]
-    ),
-    data.frame(
-      scenario = scenario,
-      method = "complete case",
-      beta_x = unname(cc["beta_x"]),
-      se = unname(cc["se"]),
-      df = NA_real_,
-      fmi = NA_real_,
-      ci_low = cc_ci[1],
-      ci_high = cc_ci[2]
-    ),
-    data.frame(
-      scenario = scenario,
-      method = "jomo pooled",
-      beta_x = unname(mi["beta_x"]),
-      se = unname(mi["se"]),
-      df = unname(mi["df"]),
-      fmi = unname(mi["fmi"]),
-      ci_low = unname(mi["ci_low"]),
-      ci_high = unname(mi["ci_high"])
-    )
-  )
-}
-
-results <- rbind(
-  comparison_rows("MCAR", dat_mcar, pool_mcar),
-  comparison_rows("MAR", dat_mar, pool_mar),
-  comparison_rows("MNAR", dat_mnar, pool_mnar)
-)
-
-results$bias_from_generating_beta <- results$beta_x - TRUE_BETA_X
-results$difference_from_complete_data <- results$beta_x - truth["beta_x"]
-rownames(results) <- NULL
-
-cat("\n=== Section 10: THE PAYOFF TABLE (generating beta_x = 0.8) ===\n")
-print(format(results, digits = 3, nsmall = 3), row.names = FALSE)
-
-cat("\nHow to read the table:\n")
-cat(" * Compare beta_x with both 0.800 and the finite-sample complete-data row.\n")
-cat(" * MCAR: CC and jomo should both be approximately unbiased.\n")
-cat(" * MAR : jomo should usually recover more of the outcome-dependent loss.\n")
-cat(" * MNAR: neither ordinary MAR-based approach is guaranteed to recover truth.\n")
-cat(" * FMI quantifies how much pooled uncertainty is attributable to missingness.\n")
-
-
-# =============================================================================
-# 11. OPTIONAL: ADD AN INCOMPLETE BINARY VARIABLE
-# -----------------------------------------------------------------------------
-# Change RUN_CATEGORICAL_EXTENSION near the top to TRUE after the continuous
-# example is understood. jomo will see numeric y/x plus factor smoke and select
-# a mixed-data engine (jomo1ranmix). It represents binary smoke with an
-# underlying latent normal variable during MCMC, then converts imputed latent
-# draws back to the observed categories.
-#
-# This block demonstrates data-type handling only. If smoke were part of the
-# substantive analysis, that analysis would also need to be fitted and pooled.
-#
-# WHAT A SUCCESSFUL DEMONSTRATION SHOULD SHOW:
-#   1. jomo reports that it selected jomo1ranmix.
-#   2. Every deleted smoke value is filled, while observed smoke values remain
-#      unchanged.
-#   3. The completed yes/no proportions are reasonably close to the original
-#      complete-data proportions, including among the rows deliberately hidden.
-#      They should not match exactly because each imputation is a random draw.
-#   4. At least some hidden smoke values vary across imputations. That variation
-#      represents uncertainty; identical completed datasets would be suspicious.
-#   5. The smoke.1 coefficients and covariances printed by jomo are on an
-#      underlying latent-normal scale, not the scale of a logistic regression.
-#      Its level-1 variance is fixed at 1 for identification, which is expected.
-#
-# In a real dataset the hidden truth is unavailable. We would instead compare
-# observed and imputed distributions, inspect relationships with key variables,
-# diagnose the mixed-data MCMC chains, and pool any substantive smoke analysis.
-# Exact recovery of each person's true category is not the goal of multiple
-# imputation; recovery of distributions, relationships, and uncertainty is.
-# =============================================================================
-
-if (RUN_CATEGORICAL_EXTENSION) {
-  mixed_data <- dat_mar
-
-  # Save the complete smoking values before hiding any of them. This is possible
-  # only because this is a simulation and gives us a benchmark for recovery.
-  smoke_truth <- mixed_data$smoke
-  smoke_levels <- levels(smoke_truth)
-
-  set.seed(1101)
-  remove_smoke <- runif(nrow(mixed_data)) < 0.20
-  mixed_data$smoke[remove_smoke] <- NA
-
-  mixed_inputs <- make_jomo_inputs(mixed_data, include_smoke = TRUE)
-
-  stopifnot(is.factor(mixed_inputs$Y$smoke))
-
-  cat("\n=== Section 11: optional continuous + binary imputation ===\n")
-  cat(sprintf("Missing smoke values: %d\n", sum(is.na(mixed_data$smoke))))
-  cat("jomo should report that it selected jomo1ranmix.\n")
-
-  set.seed(1102)
-  imp_mixed <- jomo::jomo(
-    Y = mixed_inputs$Y,
-    X = mixed_inputs$X,
-    clus = mixed_inputs$clus,
-    nburn = N_BURN,
-    nbetween = N_BETWEEN,
-    nimp = N_IMPUTATIONS,
-    meth = "common",
-    output = 1
-  )
-
-  completed_mixed <- jomo_completed_list(imp_mixed)
-
-  # Basic integrity checks. Both should be TRUE.
-  all_smoke_filled <- all(vapply(
-    completed_mixed,
-    function(data) !anyNA(data$smoke),
-    logical(1)
+  imputation_1 = prop.table(table(
+    factor(mixed1$smoke, levels = smoke_levels)
+  )),
+  imputation_2 = prop.table(table(
+    factor(mixed2$smoke, levels = smoke_levels)
+  )),
+  imputation_3 = prop.table(table(
+    factor(mixed3$smoke, levels = smoke_levels)
+  )),
+  imputation_4 = prop.table(table(
+    factor(mixed4$smoke, levels = smoke_levels)
+  )),
+  imputation_5 = prop.table(table(
+    factor(mixed5$smoke, levels = smoke_levels)
   ))
+)
 
-  observed_smoke_unchanged <- all(vapply(
-    completed_mixed,
-    function(data) identical(
-      as.character(data$smoke[!remove_smoke]),
-      as.character(smoke_truth[!remove_smoke])
-    ),
-    logical(1)
-  ))
+smoke_distribution_comparison <- rbind(
+  smoke_distribution_comparison,
+  mean_imputation = colMeans(smoke_distribution_comparison[2:6, ])
+)
 
-  cat("\nSmoke imputation integrity checks:\n")
-  cat(sprintf("All missing smoke values filled: %s\n", all_smoke_filled))
-  cat(sprintf("Originally observed smoke values unchanged: %s\n",
-              observed_smoke_unchanged))
+cat("\nSmoking distribution: truth versus completed datasets\n")
+print(round(smoke_distribution_comparison, 3))
 
-  # Compare the full-sample category distribution with the original truth.
-  # The mean-imputation row should be close to complete_truth. Exact equality is
-  # neither required nor expected.
-  smoke_proportions <- function(values) {
-    proportions <- prop.table(table(factor(values, levels = smoke_levels)))
-    stats::setNames(as.numeric(proportions), smoke_levels)
-  }
+# The full-sample distribution is dominated by the 80% of smoke values that
+# were never missing. Therefore, we also focus only on the deliberately hidden
+# rows. Their imputed "yes" proportions should fluctuate around the true hidden
+# proportion rather than reproduce it exactly in every completed dataset.
+hidden_smoke_recovery <- c(
+  complete_truth = mean(smoke_truth[remove_smoke] == "yes"),
+  imputation_1 = mean(mixed1$smoke[remove_smoke] == "yes"),
+  imputation_2 = mean(mixed2$smoke[remove_smoke] == "yes"),
+  imputation_3 = mean(mixed3$smoke[remove_smoke] == "yes"),
+  imputation_4 = mean(mixed4$smoke[remove_smoke] == "yes"),
+  imputation_5 = mean(mixed5$smoke[remove_smoke] == "yes")
+)
 
-  completed_smoke_distributions <- do.call(
-    rbind,
-    lapply(completed_mixed, function(data) smoke_proportions(data$smoke))
-  )
+cat("\nProportion 'yes' among deliberately hidden rows\n")
+print(round(hidden_smoke_recovery, 3))
 
-  smoke_distribution_comparison <- rbind(
-    complete_truth = smoke_proportions(smoke_truth),
-    observed_after_deletion = smoke_proportions(mixed_data$smoke),
-    completed_smoke_distributions,
-    mean_imputation = colMeans(completed_smoke_distributions)
-  )
+smoke_results_file <- file.path(
+  output_directory,
+  "jomo_smoke_distribution_results.csv"
+)
+write.csv(
+  smoke_distribution_comparison,
+  smoke_results_file,
+  row.names = TRUE
+)
+cat("Saved smoking results:", normalizePath(smoke_results_file), "\n")
 
-  cat("\nFull-sample smoke distribution comparison:\n")
-  print(round(smoke_distribution_comparison, 3))
-
-  # The full-sample comparison is dominated by values that were never missing.
-  # This second table focuses only on the deliberately hidden rows. Across the
-  # five imputations, imputed_yes should fluctuate around true_yes rather than
-  # reproduce it exactly in every dataset.
-  true_yes_hidden <- mean(smoke_truth[remove_smoke] == "yes")
-  imputed_yes_hidden <- vapply(
-    completed_mixed,
-    function(data) mean(data$smoke[remove_smoke] == "yes"),
-    numeric(1)
-  )
-
-  hidden_smoke_recovery <- data.frame(
-    imputation = names(completed_mixed),
-    true_yes = rep(true_yes_hidden, length(completed_mixed)),
-    imputed_yes = imputed_yes_hidden,
-    difference = imputed_yes_hidden - true_yes_hidden,
-    row.names = NULL
-  )
-
-  cat("\nRecovery among the deliberately hidden smoke values:\n")
-  print(transform(
-    hidden_smoke_recovery,
-    true_yes = round(true_yes, 3),
-    imputed_yes = round(imputed_yes, 3),
-    difference = round(difference, 3)
-  ), row.names = FALSE)
-
-  # Multiple imputations should encode uncertainty. This reports the percentage
-  # of hidden people whose imputed category is not identical in all five sets.
-  imputed_smoke_matrix <- vapply(
-    completed_mixed,
-    function(data) as.character(data$smoke[remove_smoke]),
-    character(sum(remove_smoke))
-  )
-  percent_hidden_varying <- 100 * mean(apply(
-    imputed_smoke_matrix,
-    1,
-    function(values) length(unique(values)) > 1
-  ))
-
-  cat(sprintf(
-    "Hidden smoke values varying across imputations: %.1f%%\n",
-    percent_hidden_varying
-  ))
-}
+# What we want to see:
+#   - JOMO selects jomo1ranmix;
+#   - all_smoke_filled and observed_smoke_unchanged are TRUE;
+#   - the mean completed distribution is close to complete_truth;
+#   - hidden-row proportions vary around the hidden truth rather than matching
+#     it exactly in every imputation.
+# Multiple imputation aims to recover distributions, relationships, and
+# uncertainty—not every person's exact hidden category.
 
 
 # =============================================================================
-# 12. WHAT THIS DOES -- AND DOES NOT -- ESTABLISH FOR NHANES
+# 9. NHANES BOUNDARY
 # -----------------------------------------------------------------------------
-# This example establishes the mechanics needed for the next project step:
+# This example teaches multilevel JOMO mechanics, but it is not yet a complete
+# NHANES implementation. A JOMO cluster can resemble an NHANES PSU because it
+# represents dependence among people sampled from the same group. However,
+# simply setting clus equal to PSU does not automatically incorporate:
+#   - NHANES sampling weights;
+#   - sampling strata;
+#   - the nesting and uniqueness of PSU identifiers across survey cycles;
+#   - survey-weighted estimation after imputation; or
+#   - structural missingness caused by eligibility and questionnaire routing.
 #
-#   - create Y / X / clus inputs,
-#   - preserve a two-level dependence structure,
-#   - run a dry check,
-#   - diagnose MCMC convergence,
-#   - choose nburn / nbetween,
-#   - create multiple completed datasets,
-#   - fit and pool the substantive model.
-#
-# It does NOT establish that setting clus = PSU fully incorporates the NHANES
-# sample design. For the real project we still need to decide, justify, and
-# test how to handle:
-#
-#   - a verified unique PSU identifier within the combined cycles,
-#   - strata,
-#   - examination/interview/subsample weights,
-#   - survey-weighted substantive analyses after imputation, and
-#   - whether design variables enter as fixed predictors, grouping variables,
-#     or through some other survey-aware imputation strategy.
-#
-# Ordinary jomo assumes MAR given the imputation-model information. MCAR was a
-# convenient first scenario, not an assumption required by the method. MNAR
-# requires explicit sensitivity analysis rather than a standard jomo run.
+# Those features require explicit decisions about the imputation model and the
+# final survey analysis. This toy example establishes the JOMO workflow that
+# will support those later decisions; it does not settle them.
 # =============================================================================
 
-cat("\nDone. Re-read Sections 4, 6, 7, 9, 10, and 12 for the teach-back.\n")
-cat("Core sentence: jomo fits one multilevel joint distribution, uses MCMC to\n")
-cat("draw missing values and parameters, and Rubin's rules carry imputation\n")
-cat("uncertainty into the final pooled estimate.\n")
+cat("\nDone. JOMO fits one multilevel joint distribution, uses MCMC to draw\n")
+cat("plausible missing values, and pools analyses with Rubin's rules.\n")
